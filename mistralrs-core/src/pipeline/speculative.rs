@@ -3,16 +3,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use candle_core::{quantized::GgmlDType, Device, IndexOp, Result, Tensor};
+use anyhow::Result as anyhowResult;
+use candle_core::{quantized::GgmlDType, DType, Device, IndexOp, Result, Tensor};
 use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
 
 use crate::{
     finish_and_add_tokens_to_seq, get_mut_arcmutex,
-    models::Cache,
     pipeline::{
         sampling::{sample_sequence, sample_target_sequence_speculative},
-        AdapterInstruction,
+        AdapterInstruction, Cache,
     },
     prefix_cacher::PrefixCacheManager,
     sequence::{Sequence, SequenceRecognizer},
@@ -22,6 +22,7 @@ use crate::{
 use super::{
     cache_manager::DefaultCacheManager, calculate_inputs, chat_template::ChatTemplate,
     sampling::SpeculativeSample, CacheInstruction, CacheManager, GeneralMetadata, ModelInputs,
+    ModelPaths,
 };
 
 pub struct SpeculativeLoader {
@@ -31,17 +32,18 @@ pub struct SpeculativeLoader {
 }
 
 impl Loader for SpeculativeLoader {
-    fn load_model(
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
-        dtype: Option<candle_core::DType>,
+        dtype: Option<DType>,
         device: &Device,
         silent: bool,
         mapper: DeviceMapMetadata,
         in_situ_quant: Option<GgmlDType>,
-    ) -> anyhow::Result<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
-        let target = self.target.load_model(
+    ) -> anyhowResult<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
+        let target = self.target.load_model_from_hf(
             revision.clone(),
             token_source.clone(),
             dtype,
@@ -50,13 +52,46 @@ impl Loader for SpeculativeLoader {
             mapper.clone(),
             in_situ_quant,
         )?;
-        let draft = self.draft.load_model(
+        let draft = self.draft.load_model_from_hf(
             revision,
             token_source,
             dtype,
             device,
             silent,
             mapper,
+            in_situ_quant,
+        )?;
+        Ok(Arc::new(tokio::sync::Mutex::new(SpeculativePipeline::new(
+            target,
+            draft,
+            self.config,
+        )?)))
+    }
+
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn load_model_from_path(
+        &self,
+        paths: &Box<dyn ModelPaths>,
+        dtype: Option<DType>,
+        device: &Device,
+        silent: bool,
+        mapper: DeviceMapMetadata,
+        in_situ_quant: Option<GgmlDType>,
+    ) -> anyhowResult<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
+        let target = self.target.load_model_from_path(
+            paths,
+            dtype,
+            device,
+            silent,
+            mapper.clone(),
+            in_situ_quant,
+        )?;
+        let draft = self.draft.load_model_from_path(
+            paths,
+            dtype,
+            device,
+            silent,
+            mapper.clone(),
             in_situ_quant,
         )?;
         Ok(Arc::new(tokio::sync::Mutex::new(SpeculativePipeline::new(

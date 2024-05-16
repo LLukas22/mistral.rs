@@ -1,13 +1,26 @@
 use indexmap::IndexMap;
 use mistralrs_core::{
     Constraint, MistralRs, NormalRequest, Request, RequestMessage, Response, SamplingParams,
+    TERMINATE_ALL_NEXT_STEP,
 };
+use once_cell::sync::Lazy;
 use std::{
     io::{self, Write},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 use tokio::sync::mpsc::channel;
 use tracing::{error, info};
+
+fn exit_handler() {
+    std::process::exit(0);
+}
+
+fn terminate_handler() {
+    TERMINATE_ALL_NEXT_STEP.store(true, Ordering::SeqCst);
+}
+
+static CTRLC_HANDLER: Lazy<Mutex<&'static (dyn Fn() + Sync)>> =
+    Lazy::new(|| Mutex::new(&exit_handler));
 
 pub async fn interactive_mode(mistralrs: Arc<MistralRs>) {
     let sender = mistralrs.get_sender();
@@ -26,7 +39,17 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>) {
         n_choices: 1,
     };
     info!("Starting interactive loop with sampling params: {sampling_params:?}");
+
+    // Set the handler to process exit
+    *CTRLC_HANDLER.lock().unwrap() = &exit_handler;
+
+    ctrlc::set_handler(move || CTRLC_HANDLER.lock().unwrap()())
+        .expect("Failed to set CTRL-C handler for interactive mode");
+
     'outer: loop {
+        // Set the handler to process exit
+        *CTRLC_HANDLER.lock().unwrap() = &exit_handler;
+
         let mut prompt = String::new();
         print!("> ");
         io::stdout().flush().unwrap();
@@ -36,6 +59,10 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>) {
         if prompt.is_empty() {
             return;
         }
+
+        // Set the handler to terminate all seqs, so allowing cancelling running
+        *CTRLC_HANDLER.lock().unwrap() = &terminate_handler;
+
         let mut user_message = IndexMap::new();
         user_message.insert("role".to_string(), "user".to_string());
         user_message.insert("content".to_string(), prompt);

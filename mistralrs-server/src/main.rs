@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
         warn!("Using flash attention with a quantized model has no effect!")
     }
     info!("Model kind is: {}", loader.get_kind().to_string());
-    let pipeline = loader.load_model(
+    let pipeline = loader.load_model_from_hf(
         None,
         args.token_source,
         None,
@@ -302,14 +302,13 @@ async fn main() -> Result<()> {
     .with_opt_log(args.log)
     .with_truncate_sequence(args.truncate_sequence)
     .with_no_kv_cache(args.no_kv_cache)
-    .with_prefix_cache_n(args.prefix_cache_n);
+    .with_prefix_cache_n(args.prefix_cache_n)
+    .build();
 
     if args.interactive_mode {
-        interactive_mode(mistralrs.with_interactive().build()).await;
+        interactive_mode(mistralrs).await;
         return Ok(());
     }
-
-    let mistralrs = mistralrs.build();
 
     let port = args.port.expect("Expected port to be specified.");
 

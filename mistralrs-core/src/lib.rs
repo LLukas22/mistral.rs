@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::mpsc::{channel, Sender};
 
 use engine::Engine;
+pub use engine::TERMINATE_ALL_NEXT_STEP;
 pub use mistralrs_lora::Ordering;
 pub use pipeline::Pipeline;
 
@@ -39,10 +40,10 @@ mod xlora_models;
 pub use device_map::{DeviceMapMetadata, LayerDeviceMapper};
 pub use pipeline::{
     GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder,
-    GGUFSpecificConfig, GemmaLoader, LlamaLoader, Loader, MistralLoader, MixtralLoader, ModelKind,
-    NormalLoader, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Phi2Loader,
-    Phi3Loader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader, SpeculativePipeline,
-    TokenSource,
+    GGUFSpecificConfig, GemmaLoader, LlamaLoader, Loader, LocalModelPaths, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, NormalLoader, NormalLoaderBuilder, NormalLoaderType,
+    NormalSpecificConfig, Phi2Loader, Phi3Loader, Qwen2Loader, SpeculativeConfig,
+    SpeculativeLoader, SpeculativePipeline, TokenSource,
 };
 pub use request::{Constraint, NormalRequest, Request, RequestMessage};
 pub use response::Response;
@@ -77,7 +78,7 @@ pub struct MistralRsBuilder {
     no_prefix_cache: Option<bool>,
     prefix_cache_n: Option<usize>,
     disable_eos_stop: Option<bool>,
-    interactive: Option<bool>,
+    gemm_full_precision_f16: Option<bool>,
 }
 
 impl MistralRsBuilder {
@@ -91,10 +92,9 @@ impl MistralRsBuilder {
             no_prefix_cache: None,
             prefix_cache_n: None,
             disable_eos_stop: None,
-            interactive: None,
+            gemm_full_precision_f16: None,
         }
     }
-
     pub fn with_log(mut self, log: String) -> Self {
         self.log = Some(log);
         self
@@ -123,8 +123,8 @@ impl MistralRsBuilder {
         self.disable_eos_stop = Some(disable_eos_stop);
         self
     }
-    pub fn with_interactive(mut self) -> Self {
-        self.interactive = Some(true);
+    pub fn with_gemm_full_precision_f16(mut self, gemm_full_precision: bool) -> Self {
+        self.gemm_full_precision_f16 = Some(gemm_full_precision);
         self
     }
 
@@ -132,6 +132,15 @@ impl MistralRsBuilder {
         MistralRs::new(self)
     }
 }
+
+#[cfg(feature = "cuda")]
+fn set_gemm_reduced_precision_f16() {
+    candle_core::cuda::set_gemm_reduced_precision_f16(true);
+    candle_core::cuda::set_gemm_reduced_precision_bf16(true);
+}
+
+#[cfg(not(feature = "cuda"))]
+fn set_gemm_reduced_precision_f16() {}
 
 impl MistralRs {
     fn new(config: MistralRsBuilder) -> Arc<Self> {
@@ -144,15 +153,18 @@ impl MistralRs {
             no_prefix_cache,
             prefix_cache_n,
             disable_eos_stop,
-            interactive,
+            gemm_full_precision_f16,
         } = config;
+
+        if !gemm_full_precision_f16.unwrap_or(false) {
+            set_gemm_reduced_precision_f16();
+        }
 
         let truncate_sequence = truncate_sequence.unwrap_or(false);
         let no_kv_cache = no_kv_cache.unwrap_or(false);
         let no_prefix_cache = no_prefix_cache.unwrap_or(false);
         let prefix_cache_n = prefix_cache_n.unwrap_or(16);
         let disable_eos_stop = disable_eos_stop.unwrap_or(false);
-        let interactive = interactive.unwrap_or(false);
 
         let (tx, rx) = channel(10_000);
 
@@ -178,7 +190,6 @@ impl MistralRs {
                     no_prefix_cache,
                     prefix_cache_n,
                     disable_eos_stop,
-                    interactive,
                 );
                 engine.run().await;
             });

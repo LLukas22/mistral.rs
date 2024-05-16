@@ -5,11 +5,12 @@ use super::{
 };
 use crate::aici::bintokens::build_tok_trie;
 use crate::aici::toktree::TokTrie;
-use crate::models::Cache;
 use crate::pipeline::chat_template::calculate_eos_tokens;
-use crate::pipeline::{ChatTemplate, SimpleModelPaths};
+use crate::pipeline::Cache;
+use crate::pipeline::{ChatTemplate, LocalModelPaths};
 use crate::prefix_cacher::PrefixCacheManager;
 use crate::sequence::Sequence;
+use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::varbuilder_utils::{from_mmaped_safetensors, load_preload_adapters};
 use crate::xlora_models::NonGranularState;
 use crate::{deserialize_chat_template, do_sample, get_mut_arcmutex, get_paths, DeviceMapMetadata};
@@ -276,7 +277,7 @@ fn parse_gguf_value(value: &GgufValue) -> String {
 
 impl Loader for GGUFLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model(
+    fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -287,7 +288,7 @@ impl Loader for GGUFLoader {
         in_situ_quant: Option<GgmlDType>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let paths: anyhow::Result<Box<dyn ModelPaths>> = get_paths!(
-            SimpleModelPaths,
+            LocalModelPaths,
             &token_source,
             revision,
             self,
@@ -295,8 +296,19 @@ impl Loader for GGUFLoader {
             self.quantized_filename,
             silent
         );
-        let paths = paths?;
+        self.load_model_from_path(&paths?, _dtype, device, silent, mapper, in_situ_quant)
+    }
 
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn load_model_from_path(
+        &self,
+        paths: &Box<dyn ModelPaths>,
+        _dtype: Option<DType>,
+        device: &Device,
+        silent: bool,
+        mapper: DeviceMapMetadata,
+        in_situ_quant: Option<GgmlDType>,
+    ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         if in_situ_quant.is_some() {
             anyhow::bail!(
                 "You are trying to in-situ quantize a GGUF model. This will not do anything."
@@ -312,9 +324,11 @@ impl Loader for GGUFLoader {
             .map_err(anyhow::Error::msg)?;
 
         info!("Model config:");
-        for (name, value) in &model.metadata {
+        let mut sorted_keys = model.metadata.keys().collect::<Vec<_>>();
+        sorted_keys.sort();
+        for name in sorted_keys {
             if !name.contains("tokenizer") {
-                let value = parse_gguf_value(value);
+                let value = parse_gguf_value(&model.metadata[name]);
                 println!("{name}: {}", value);
             }
         }
@@ -433,14 +447,13 @@ impl Loader for GGUFLoader {
                             silent,
                         )?,
                     )?),
-                    a => bail!("Unsupported architecture for GGUF X-LoRA `{a:?}`"),
+                    a => bail!("Unsupported architecture for GGUF LoRA `{a:?}`"),
                 }
             }
             _ => unreachable!(),
         };
 
-        let tokenizer =
-            Tokenizer::from_file(paths.get_tokenizer_filename()).map_err(anyhow::Error::msg)?;
+        let tokenizer = get_tokenizer(paths.get_tokenizer_filename())?;
 
         let (chat_template, gen_conf) = deserialize_chat_template!(paths, self);
 
