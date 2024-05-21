@@ -2,6 +2,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::{
+    layers::ScaledDotProductAttention,
+    lora::{linear, LinearLayerLike, LoraConfig, Ordering},
+};
 /// Phi model.
 /// https://huggingface.co/microsoft/phi-2
 /// There is an alternative implementation of the phi model in mixformers.rs.
@@ -11,13 +15,12 @@ use candle_core::{quantized::QMatMul, DType, Device, Result, Tensor};
 use candle_nn::{
     embedding, layer_norm, Activation, Embedding, LayerNorm, RotaryEmbedding, VarBuilder,
 };
-use mistralrs_lora::{layer::QLinear, linear, LinearLayerLike, LoraConfig, Ordering};
 use tqdm::Iter;
 use tracing::info;
 
 use crate::{
     device_map::DeviceMapper,
-    layers::{flash_attn, repeat_kv, CausalMasker},
+    layers::{repeat_kv, CausalMasker, QLinear},
     models::phi2::Config,
     pipeline::{extract_logits, NormalModel},
     DeviceMapMetadata,
@@ -117,12 +120,10 @@ struct Attention {
     q_layernorm: Option<LayerNorm>,
     k_layernorm: Option<LayerNorm>,
     rotary_emb: RotaryEmbedding,
-    softmax_scale: f64,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     use_flash_attn: bool,
-    neg_inf: Tensor,
 }
 
 impl Attention {
@@ -189,7 +190,6 @@ impl Attention {
         } else {
             (None, None)
         };
-        let softmax_scale = 1f64 / (head_dim as f64).sqrt();
         Ok(Self {
             q_proj,
             k_proj,
@@ -198,12 +198,10 @@ impl Attention {
             q_layernorm,
             k_layernorm,
             rotary_emb: rope,
-            softmax_scale,
             num_heads,
             num_kv_heads,
             head_dim,
             use_flash_attn: cfg.use_flash_attn,
-            neg_inf: Tensor::new(f32::NEG_INFINITY, vb.device())?.to_dtype(vb.dtype())?,
         })
     }
 
@@ -288,24 +286,17 @@ impl Attention {
         let k = repeat_kv(k, self.num_heads / self.num_kv_heads)?.contiguous()?;
         let v = repeat_kv(v, self.num_heads / self.num_kv_heads)?.contiguous()?;
 
-        let attn_output = if self.use_flash_attn {
-            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
-            let q = q.transpose(1, 2)?;
-            let k = k.transpose(1, 2)?;
-            let v = v.transpose(1, 2)?;
-            flash_attn(&q, &k, &v, self.softmax_scale as f32, seq_len > 1)?.transpose(1, 2)?
-        } else {
-            let attn_weights = (q
-                .to_dtype(DType::F32)?
-                .contiguous()?
-                .matmul(&k.to_dtype(DType::F32)?.t()?)?
-                * self.softmax_scale)?;
-            let attn_weights =
-                CausalMasker.apply_mask(&mask.cloned(), attn_weights, &self.neg_inf)?;
-            let attn_weights =
-                candle_nn::ops::softmax_last_dim(&attn_weights)?.to_dtype(v.dtype())?;
-            attn_weights.matmul(&v)?
-        };
+        let attn_output = ScaledDotProductAttention.run_attention(
+            &q,
+            &k,
+            &v,
+            self.num_heads,
+            self.head_dim,
+            mask,
+            self.use_flash_attn,
+            b_size,
+            seq_len,
+        )?;
 
         let mut attn_output = attn_output
             .transpose(1, 2)?
@@ -547,7 +538,12 @@ impl Model {
         } else {
             self.cache.lock()
         };
-        let mask = CausalMasker.make_causal_mask(input_ids, &cache)?;
+        let mask = CausalMasker.make_causal_mask_as_attn_bias(
+            input_ids,
+            &cache,
+            xs.dtype(),
+            self.layers[0].self_attn.num_heads,
+        )?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(

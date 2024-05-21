@@ -2,15 +2,18 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::{
+    layers::ScaledDotProductAttention,
+    lora::{linear_b as linear, LinearLayerLike, LoraConfig, Ordering},
+};
 use candle_core::{quantized::QMatMul, DType, Device, Module, Result, Tensor, D};
 use candle_nn::{RotaryEmbedding, VarBuilder};
-use mistralrs_lora::{layer::QLinear, linear_b as linear, LinearLayerLike, LoraConfig, Ordering};
 use tqdm::Iter;
 use tracing::info;
 
 use crate::{
     device_map::DeviceMapper,
-    layers::{flash_attn, repeat_kv, CausalMasker},
+    layers::{repeat_kv, CausalMasker, QLinear},
     models::gemma::Config,
     pipeline::{extract_logits, Cache, NormalModel},
     DeviceMapMetadata,
@@ -169,7 +172,6 @@ struct Attention {
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     use_flash_attn: bool,
-    neg_inf: Tensor,
 }
 
 impl Attention {
@@ -247,7 +249,6 @@ impl Attention {
             head_dim,
             rotary_emb,
             use_flash_attn: cfg.use_flash_attn,
-            neg_inf: Tensor::new(f32::NEG_INFINITY, vb.device())?.to_dtype(vb.dtype())?,
         })
     }
 
@@ -319,22 +320,18 @@ impl Attention {
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
-        let mut attn_output = if self.use_flash_attn {
-            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
-            let q = q.transpose(1, 2)?;
-            let k = k.transpose(1, 2)?;
-            let v = v.transpose(1, 2)?;
-            let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-            flash_attn(&q, &k, &v, softmax_scale, q_len > 1)?.transpose(1, 2)?
-        } else {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let mut attn_output = ScaledDotProductAttention.run_attention(
+            &q,
+            &k,
+            &v,
+            self.num_heads,
+            self.head_dim,
+            attention_mask,
+            self.use_flash_attn,
+            b_sz,
+            q_len,
+        )?;
 
-            let attn_weights =
-                CausalMasker.apply_mask(&attention_mask.cloned(), attn_weights, &self.neg_inf)?;
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&v)?
-        };
         if self.q_proj.is_quant() {
             attn_output = attn_output.to_dtype(DType::F32)?;
         }
@@ -586,8 +583,13 @@ impl XLoraModel {
         } else {
             self.cache.lock()
         };
-        let attention_mask = CausalMasker.make_causal_mask(input_ids, &cache)?;
         let xs = self.embed_tokens.forward(input_ids)?;
+        let attention_mask = CausalMasker.make_causal_mask_as_attn_bias(
+            input_ids,
+            &cache,
+            xs.dtype(),
+            self.layers[0].self_attn.num_heads,
+        )?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             xs = self.mapper.map(xs, i)?;

@@ -1,16 +1,19 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use crate::{
+    layers::ScaledDotProductAttention,
+    lora::{linear_no_bias, LinearLayerLike, LoraConfig, Ordering},
+};
 /// Mistral LLM, https://github.com/mistralai/mistral-src
 use candle_core::{quantized::QMatMul, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, RotaryEmbedding, VarBuilder};
-use mistralrs_lora::{layer::QLinear, linear_no_bias, LinearLayerLike, LoraConfig, Ordering};
 use std::{collections::HashMap, sync::Arc};
 use tqdm::Iter;
 use tracing::info;
 
 use crate::{
     device_map::DeviceMapper,
-    layers::{flash_attn, repeat_kv, CausalMasker, RmsNorm},
+    layers::{repeat_kv, CausalMasker, QLinear, RmsNorm},
     models::mistral::Config,
     pipeline::{extract_logits, Cache, NormalModel},
     DeviceMapMetadata,
@@ -133,7 +136,6 @@ struct Attention {
     rotary_emb: Arc<RotaryEmbedding>,
     use_flash_attn: bool,
     sliding_window: Option<usize>,
-    neg_inf: Tensor,
 }
 
 impl Attention {
@@ -207,7 +209,6 @@ impl Attention {
             rotary_emb,
             use_flash_attn: cfg.use_flash_attn,
             sliding_window: cfg.sliding_window,
-            neg_inf: Tensor::new(f32::NEG_INFINITY, vb.device())?.to_dtype(vb.dtype())?,
         })
     }
 
@@ -286,21 +287,18 @@ impl Attention {
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
-        let mut attn_output = if self.use_flash_attn {
-            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
-            let q = q.transpose(1, 2)?;
-            let k = k.transpose(1, 2)?;
-            let v = v.transpose(1, 2)?;
-            let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-            flash_attn(&q, &k, &v, softmax_scale, q_len > 1)?.transpose(1, 2)?
-        } else {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let mut attn_output = ScaledDotProductAttention.run_attention(
+            &q,
+            &k,
+            &v,
+            self.num_heads,
+            self.head_dim,
+            attn_mask.as_ref(),
+            self.use_flash_attn,
+            b_sz,
+            q_len,
+        )?;
 
-            let attn_weights = CausalMasker.apply_mask(&attn_mask, attn_weights, &self.neg_inf)?;
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&v)?
-        };
         if self.q_proj.is_quant() {
             attn_output = attn_output.to_dtype(DType::F32)?;
         }
@@ -557,12 +555,14 @@ impl XLoraModel {
         } else {
             self.cache.lock()
         };
-        let attention_mask = CausalMasker.make_causal_mask_with_sliding_window(
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let attention_mask = CausalMasker.make_causal_mask_with_sliding_window_as_attn_bias(
             input_ids,
             &cache,
             self.sliding_window,
+            xs.dtype(),
+            self.layers[0].self_attn.num_heads,
         )?;
-        let mut xs = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(

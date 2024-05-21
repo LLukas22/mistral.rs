@@ -6,7 +6,16 @@ use crate::device_map::DeviceMapper;
 use crate::layers::repeat_kv;
 use crate::layers::verify_sanity_gguf;
 use crate::layers::CausalMasker;
+use crate::layers::MatMul;
 use crate::layers::RmsNorm;
+use crate::layers::ScaledDotProductAttention;
+use crate::lora::get_lora_cfg;
+use crate::lora::AdapterSwapper;
+use crate::lora::LinearLayerLike;
+use crate::lora::LoraConfig;
+use crate::lora::Merge;
+use crate::lora::Ordering;
+use crate::lora::QLoraLinear;
 use crate::pipeline::extract_logits;
 use crate::DeviceMapMetadata;
 use candle_core::quantized::gguf_file;
@@ -15,13 +24,6 @@ use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::Embedding;
 use candle_nn::VarBuilder;
-use mistralrs_lora::get_lora_cfg;
-use mistralrs_lora::AdapterSwapper;
-use mistralrs_lora::LinearLayerLike;
-use mistralrs_lora::LoraConfig;
-use mistralrs_lora::Merge;
-use mistralrs_lora::Ordering;
-use mistralrs_lora::QLoraLinear;
 use tqdm::Iter;
 use tracing::info;
 
@@ -86,7 +88,6 @@ struct LayerWeights {
     head_dim: usize,
     cos: Tensor,
     sin: Tensor,
-    neg_inf: Tensor,
     sliding_window: usize,
 }
 
@@ -159,11 +160,18 @@ impl LayerWeights {
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = CausalMasker.apply_mask(&attn_mask, att, &self.neg_inf)?;
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        // Convert to contiguous as matmul doesn't support strided vs for now.
-        let y = att.matmul(&v.contiguous()?)?;
+        let y = ScaledDotProductAttention.run_attention(
+            &q,
+            &k,
+            &v,
+            self.n_head,
+            self.head_dim,
+            attn_mask.as_ref(),
+            false,
+            b_sz,
+            seq_len,
+        )?;
+
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
         let y =
             self.attn_output
@@ -234,7 +242,6 @@ impl ModelWeights {
         let rms_eps = md_get("phi3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let context_window = md_get("phi3.context_length")?.to_u32()? as usize;
         let (cos, sin) = precomput_freqs_cis(rope_dim, 10_000., device, context_window)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings.dequantize(device)?;
@@ -314,7 +321,6 @@ impl ModelWeights {
                 head_dim: embedding_length / head_count,
                 cos: cos.clone(),
                 sin: sin.clone(),
-                neg_inf: neg_inf.clone(),
                 sliding_window: context_window,
             })
         }
@@ -379,10 +385,12 @@ impl ModelWeights {
         } else {
             self.cache.lock()
         };
-        let mask = CausalMasker.make_causal_mask_with_sliding_window(
+        let mask = CausalMasker.make_causal_mask_with_sliding_window_as_attn_bias(
             input_ids,
             &cache,
             Some(self.max_seq_len),
+            xs.dtype(),
+            self.layers[0].n_head,
         )?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if let Some(ref mapper) = self.mapper {
@@ -451,42 +459,48 @@ impl ModelWeights {
 
             if no_kv_cache {
                 extract_logits(
-                    &self
-                        .inner_forward(
-                            input_ids_full,
-                            seqlen_offsets_full,
-                            Some(scalings),
-                            true,
-                            no_kv_cache,
-                            None,
-                        )?
-                        .contiguous()?
-                        .apply(&self.output)?,
+                    &MatMul.qmatmul(
+                        &self
+                            .inner_forward(
+                                input_ids_full,
+                                seqlen_offsets_full,
+                                Some(scalings),
+                                true,
+                                no_kv_cache,
+                                None,
+                            )?
+                            .contiguous()?,
+                        &self.output,
+                    )?,
                     context_lens,
                 )
             } else {
                 // is_full_pass=true is ok because no_kv_cache=false
                 extract_logits(
-                    &self
-                        .inner_forward(
-                            input_ids,
-                            seqlen_offsets,
-                            Some(scalings),
-                            true,
-                            no_kv_cache,
-                            None,
-                        )?
-                        .contiguous()?
-                        .apply(&self.output)?,
+                    &MatMul.qmatmul(
+                        &self
+                            .inner_forward(
+                                input_ids,
+                                seqlen_offsets,
+                                Some(scalings),
+                                true,
+                                no_kv_cache,
+                                None,
+                            )?
+                            .contiguous()?,
+                        &self.output,
+                    )?,
                     context_lens,
                 )
             }
         } else {
             extract_logits(
-                &self
-                    .inner_forward(input_ids, seqlen_offsets, None, false, no_kv_cache, None)?
-                    .contiguous()?
-                    .apply(&self.output)?,
+                &MatMul.qmatmul(
+                    &self
+                        .inner_forward(input_ids, seqlen_offsets, None, false, no_kv_cache, None)?
+                        .contiguous()?,
+                    &self.output,
+                )?,
                 context_lens,
             )
         }

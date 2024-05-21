@@ -1,22 +1,27 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::{collections::HashMap, ops::Mul, str::FromStr, sync::Mutex};
-
-use candle_core::{quantized::QTensor, DType, Device, IndexOp, Result, Tensor, WithDType};
-use candle_nn::{
-    layer_norm::{RmsNormNonQuantized, RmsNormQuantized},
-    Module, VarBuilder,
+use std::{
+    ops::Mul,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
-use once_cell::sync::Lazy;
 
-static MASKS: Lazy<Mutex<HashMap<(usize, usize), Tensor>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+use candle_core::{
+    quantized::{gguf_file, QMatMul, QTensor},
+    DType, Device, IndexOp, Result, Tensor,
+};
+use candle_nn::{Linear, Module, VarBuilder};
 
-use crate::models::phi3;
+pub use crate::layers_masker::CausalMasker;
+pub use crate::layers_utils::{flash_attn, repeat_kv, verify_sanity_gguf};
+
+use crate::{cublaslt::CUBLASLT_HANDLE, models::phi3, INHIBIT_GEMM_F16};
 
 #[derive(Debug, Clone)]
 pub struct RmsNorm {
-    inner: candle_nn::RmsNorm<RmsNormNonQuantized>,
     eps: f64,
     weight: Tensor,
 }
@@ -25,47 +30,37 @@ impl RmsNorm {
     pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let inner = candle_nn::rms_norm_non_quant(size, eps, vb)?;
         let w = inner.inner().weight().clone();
-        Ok(Self {
-            inner,
-            eps,
-            weight: w,
-        })
+        Ok(Self { eps, weight: w })
     }
 
     pub fn from_w(w: Tensor, eps: f64) -> Result<Self> {
-        let inner = candle_nn::RmsNorm::<RmsNormNonQuantized>::new(w.clone(), eps);
-        Ok(Self {
-            inner,
-            eps,
-            weight: w,
-        })
+        Ok(Self { eps, weight: w })
     }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if x.device().is_cpu() {
-            // Handle device mapping case
-            return candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32);
-        }
-        self.inner.forward(x)
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct QRmsNorm {
-    inner: candle_nn::RmsNorm<RmsNormQuantized>,
+    eps: f64,
+    weight: Tensor,
 }
 
 impl QRmsNorm {
     pub fn new(scale: QTensor, eps: f32) -> Result<Self> {
         let scale = scale.dequantize(&scale.device())?;
-        let inner = candle_nn::RmsNorm::<RmsNormQuantized>::new(scale, eps as f64);
-        Ok(Self { inner })
+        Ok(Self {
+            eps: eps as f64,
+            weight: scale,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.inner.forward(x)
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
     }
 }
 
@@ -236,164 +231,238 @@ impl PhiRotaryEmbedding {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_attn_mask_utils.py
-pub struct CausalMasker;
+/// Matrix multiplcation, configurable to be via f16 (to use the faster GEMM kernels) optionally.
+pub struct MatMul;
 
-// https://github.com/mokeyish/candle-ext/blob/main/src/triangular.rs
-fn apply_tril(xs: &Tensor, diagonal: isize) -> Result<Tensor> {
-    let device = xs.device();
-    let (l, s) = xs.dims2()?;
-    let mut xs_tri = vec![];
-    for i in 0..l as isize {
-        for j in 0..s as isize {
-            let cond = i + diagonal < j;
-            xs_tri.push(if cond { 0u8 } else { 1u8 });
-        }
+/// Set the matmuls to go via f16
+pub(crate) static USE_MATMUL_VIA_F16: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_use_matmul_via_f16(via_f16: bool) {
+    if !INHIBIT_GEMM_F16.load(Ordering::Relaxed) {
+        USE_MATMUL_VIA_F16.store(via_f16, Ordering::Relaxed)
     }
-    xs * Tensor::from_vec(xs_tri, (l, s), device)?.to_dtype(xs.dtype())?
+}
+pub fn get_use_matmul_via_f16() -> bool {
+    USE_MATMUL_VIA_F16.load(Ordering::Relaxed)
 }
 
-// https://github.com/mokeyish/candle-ext/blob/main/src/masked_fill.rs
-fn masked_fill<D: WithDType>(xs: &Tensor, mask: &Tensor, value: D) -> Result<Tensor> {
-    let on_true = Tensor::full(value, xs.shape(), xs.device())?;
-    let on_false = xs;
-    mask.broadcast_as(xs.shape())?
-        .where_cond(&on_true, on_false)
+impl MatMul {
+    /// Compute matrix-matrix product, optionally casting to f16 to use specialized GEMM kernels.
+    pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        if !get_use_matmul_via_f16() {
+            return a.matmul(b);
+        }
+        let original_dtype = a.dtype();
+        a.to_dtype(DType::F16)?
+            .matmul(&b.to_dtype(DType::F16)?)?
+            .to_dtype(original_dtype)
+    }
+
+    /// Compute matrix-matrix product, optionally casting to f16 to use specialized GEMM kernels.
+    /// The result will be divided by the `scale` parameter in an affine division.
+    pub fn matmul_affine_div(&self, a: &Tensor, b: &Tensor, scale: f64) -> Result<Tensor> {
+        // TODO(EricLBuehler): Optimize this by using the gemm parameter
+        self.matmul(a, b)? / scale
+    }
+
+    /// Compute quantized matrix-matrix product, optionally casting to f16 to use specialized GEMM kernels.
+    pub fn qmatmul(&self, x: &Tensor, matmul: &QMatMul) -> Result<Tensor> {
+        if get_use_matmul_via_f16() {
+            matmul.forward_via_f16(x)
+        } else {
+            matmul.forward(x)
+        }
+    }
 }
 
-impl CausalMasker {
-    fn make_mask(&self, tgt_len: usize, past_kv_len: usize, device: &Device) -> Result<Tensor> {
-        let offset = tgt_len + past_kv_len;
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| (0..offset).map(move |j| u8::from(j + tgt_len > i + offset)))
-            .collect();
-        Tensor::from_slice(&mask, (tgt_len, offset), device)
-    }
+pub struct ScaledDotProductAttention;
 
-    pub fn calculate_past_kv_len(
+impl ScaledDotProductAttention {
+    /// Computes softmax(QK^T*sqrt(d_k))V
+    ///
+    /// The attention implementation is dispatched as follows:
+    /// 1) If `use_flash_attn == true`, use a flash attention V2 kernel
+    /// 2) If using CUDA and the cuBLASLt kernel is initialized, then it will use an optimized version.
+    /// 3) Otherwise, use the "naive" SDPA implementation.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub fn run_attention(
         &self,
-        cache: &[Option<(Tensor, Tensor)>],
-    ) -> candle_core::Result<usize> {
-        let kv_cache_1 = &cache[0];
-        if kv_cache_1.is_none() {
-            return Ok(0);
-        }
-        let k_cache_1 = &kv_cache_1.as_ref().unwrap().0;
-        return Ok(k_cache_1.dims()[2]);
-    }
-
-    pub fn make_causal_mask(
-        &self,
-        input_ids: &Tensor,
-        cache: &[Option<(Tensor, Tensor)>],
-    ) -> Result<Option<Tensor>> {
-        let past_kv_len = self.calculate_past_kv_len(cache)?;
-        let (b_sz, tgt_len) = input_ids.dims2()?;
-        if tgt_len == 1 {
-            return Ok(None);
-        }
-        let res = MASKS.lock().unwrap().get(&(tgt_len, past_kv_len)).cloned();
-        if let Some(mask) = res {
-            Ok(Some(mask))
-        } else {
-            let mask = self.make_mask(tgt_len, past_kv_len, input_ids.device())?;
-            let mask = mask
-                .expand((b_sz, 1, tgt_len, tgt_len + past_kv_len))?
-                .to_dtype(DType::U8)?;
-
-            MASKS
-                .lock()
-                .unwrap()
-                .insert((tgt_len, past_kv_len), mask.clone());
-            Ok(Some(mask))
-        }
-    }
-
-    pub fn make_causal_mask_with_sliding_window(
-        &self,
-        input_ids: &Tensor,
-        cache: &[Option<(Tensor, Tensor)>],
-        sliding_window: Option<usize>,
-    ) -> Result<Option<Tensor>> {
-        if sliding_window.is_none() {
-            return self.make_causal_mask(input_ids, cache);
-        }
-        let sliding_window = sliding_window.unwrap();
-        let past_kv_len = self.calculate_past_kv_len(cache)?;
-        let (b_sz, tgt_len) = input_ids.dims2()?;
-        if tgt_len == 1 {
-            return Ok(None);
-        }
-        let res = MASKS.lock().unwrap().get(&(tgt_len, past_kv_len)).cloned();
-        if let Some(mask) = res {
-            Ok(Some(mask))
-        } else {
-            let mask = self.make_mask(tgt_len, past_kv_len, input_ids.device())?;
-            let diagonal = past_kv_len as isize - sliding_window as isize - 1;
-            let context_mask = apply_tril(&mask.ones_like()?, diagonal)?;
-            let mask = masked_fill(&mask.to_dtype(DType::F32)?, &context_mask, f32::MIN)?;
-            let mask = mask
-                .expand((b_sz, 1, tgt_len, tgt_len + past_kv_len))?
-                .to_dtype(DType::U8)?;
-
-            MASKS
-                .lock()
-                .unwrap()
-                .insert((tgt_len, past_kv_len), mask.clone());
-            Ok(Some(mask))
-        }
-    }
-
-    pub fn apply_mask(
-        &self,
-        mask: &Option<Tensor>,
-        att: Tensor,
-        neg_inf: &Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        n_attn_heads: usize,
+        head_dim: usize,
+        mask: Option<&Tensor>,
+        use_flash_attn: bool,
+        b_sz: usize,
+        seq_len: usize,
     ) -> Result<Tensor> {
-        match mask {
-            None => Ok(att),
-            Some(mask) => {
-                let mask = mask.broadcast_as(att.shape())?;
-                mask.where_cond(
-                    &neg_inf
-                        .to_device(att.device())?
-                        .to_dtype(att.dtype())?
-                        .broadcast_as(att.dims())?,
-                    &att,
-                )
+        if use_flash_attn {
+            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
+            let q = q.transpose(1, 2)?;
+            let k = k.transpose(1, 2)?;
+            let v = v.transpose(1, 2)?;
+            let softmax_scale = 1f32 / (head_dim as f32).sqrt();
+            return flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?.transpose(1, 2);
+        }
+
+        if let (Device::Cuda(_), Some(cublaslt)) = (q.device(), *CUBLASLT_HANDLE.lock().unwrap()) {
+            #[cfg(feature = "cuda")]
+            {
+                // cuBLASLt batch matmul implementation requires inputs to be dims3
+                let k = k.flatten(0, 1)?;
+                let q = q.flatten(0, 1)?;
+                let v = v.flatten(0, 1)?;
+                let attention_bias = mask.map(|mask| mask.flatten(0, 1)).transpose()?;
+
+                // If attention_bias is set, we fuse the add by giving it as the output matrix
+                // and setting beta to 1.0
+                let beta = match attention_bias.is_some() {
+                    true => Some(1.0),
+                    false => None,
+                };
+
+                // Batch matrix multiplication
+                // Fuse softmax scale and attention_bias add
+                let attention_scores = cublaslt.batch_matmul(
+                    &k,
+                    &q,
+                    attention_bias.as_ref(),
+                    Some((1.0 / (head_dim as f64).sqrt()) as f32),
+                    beta,
+                    None,
+                    None,
+                )?;
+                let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
+
+                let context_layer = cublaslt.batch_matmul(
+                    &v.t()?.contiguous()?,
+                    &attention_probs,
+                    // We save one allocation
+                    Some(&q),
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+
+                // Reshape to dims4
+                context_layer.reshape((b_sz, n_attn_heads, seq_len, head_dim))
             }
+            #[cfg(not(feature = "cuda"))]
+            {
+                candle_core::bail!("`cuda` feature is not enabled")
+            }
+        } else {
+            let att = MatMul.matmul_affine_div(
+                &q.contiguous()?,
+                &k.t()?.contiguous()?,
+                (head_dim as f64).sqrt(),
+            )?;
+
+            let att = match mask {
+                Some(m) => att.broadcast_add(m)?,
+                None => att,
+            };
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            // Convert to contiguous as matmul doesn't support strided vs for now.
+            MatMul.matmul(&att, &v.contiguous()?)
         }
     }
 }
 
-#[cfg(feature = "flash-attn")]
-pub fn flash_attn(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> Result<Tensor> {
-    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+#[derive(Debug, Clone)]
+pub struct QLinear {
+    inner: QMatMul,
+    bias: Option<Tensor>,
+    dtype: DType,
 }
 
-#[cfg(not(feature = "flash-attn"))]
-pub fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
-    unimplemented!("Compile with '--features flash-attn'")
-}
-
-pub fn verify_sanity_gguf(arch: &str, expected_arch: &str) -> Result<()> {
-    if arch != expected_arch {
-        candle_core::bail!("Expected `{expected_arch}` architecture, got `{arch}`.");
+impl QLinear {
+    pub fn new<R: std::io::Read + std::io::Seek>(
+        ct: &gguf_file::Content,
+        r: &mut R,
+        name: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        let w = ct.tensor(r, &format!("{name}.weight"), device)?;
+        let b = ct.tensor(r, &format!("{name}.bias"), device)?;
+        let inner = QMatMul::from_qtensor(w)?;
+        let bias = b.dequantize(device)?;
+        Ok(Self {
+            inner,
+            bias: Some(bias),
+            dtype: DType::F32,
+        })
     }
-    Ok(())
+
+    pub fn from_linear(linear: Linear) -> Self {
+        Self {
+            inner: QMatMul::Tensor(linear.weight().clone()),
+            bias: linear.bias().cloned(),
+            dtype: if linear.weight().device().is_cuda() {
+                DType::BF16
+            } else {
+                DType::F32
+            },
+        }
+    }
+
+    pub fn from_parts(w: Tensor, b: Option<Tensor>) -> Self {
+        let dtype = if w.device().is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        Self {
+            inner: QMatMul::Tensor(w),
+            bias: b,
+            dtype,
+        }
+    }
+
+    pub fn from_qparts(w: QTensor, b: Option<Tensor>) -> Self {
+        if let Some(ref b) = b {
+            assert_eq!(b.dtype(), DType::F32);
+        }
+        Self {
+            inner: QMatMul::QTensor(Arc::new(w)),
+            bias: b,
+            dtype: DType::F32,
+        }
+    }
+
+    pub fn inner(&mut self) -> &mut QMatMul {
+        &mut self.inner
+    }
+
+    pub fn is_quant(&self) -> bool {
+        matches!(self.inner, QMatMul::QTensor(_))
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
 }
 
-pub fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        Ok(x)
-    } else {
-        let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
-        Tensor::cat(&vec![&x; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+impl Module for QLinear {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = if self.is_quant() {
+            xs.to_dtype(DType::F32)?
+        } else {
+            xs.clone()
+        };
+        let forward_fn = if get_use_matmul_via_f16() {
+            QMatMul::forward
+        } else {
+            QMatMul::forward_via_f16
+        };
+        if let Some(bias) = &self.bias {
+            forward_fn(&self.inner, &xs)?
+                .broadcast_add(bias)?
+                .to_dtype(self.dtype)
+        } else {
+            forward_fn(&self.inner, &xs)?.to_dtype(self.dtype)
+        }
     }
 }

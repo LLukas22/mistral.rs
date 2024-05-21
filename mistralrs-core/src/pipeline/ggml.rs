@@ -5,6 +5,7 @@ use super::{
 };
 use crate::aici::bintokens::build_tok_trie;
 use crate::aici::toktree::TokTrie;
+use crate::lora::Ordering;
 use crate::pipeline::chat_template::calculate_eos_tokens;
 use crate::pipeline::Cache;
 use crate::pipeline::{ChatTemplate, LocalModelPaths};
@@ -22,7 +23,6 @@ use anyhow::Result;
 use candle_core::quantized::{ggml_file, GgmlDType};
 use candle_core::{DType, Device, Tensor};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
-use mistralrs_lora::Ordering;
 use rand_isaac::Isaac64Rng;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -228,6 +228,7 @@ impl Loader for GGMLLoader {
         if !mapper.is_dummy() {
             warn!("GGML models do not support device mapping. Device mapping will not work. Please consider using a GGUF model.");
         }
+        info!("Loading model `{}` on {device:?}...", self.get_id());
 
         let mut file = std::fs::File::open(paths.get_weight_filenames().first().unwrap())?;
         let model = ggml_file::Content::read(&mut file, device)

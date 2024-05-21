@@ -5,6 +5,7 @@ use super::{
 };
 use crate::aici::bintokens::build_tok_trie;
 use crate::aici::toktree::TokTrie;
+use crate::lora::Ordering;
 use crate::pipeline::chat_template::calculate_eos_tokens;
 use crate::pipeline::Cache;
 use crate::pipeline::{ChatTemplate, LocalModelPaths};
@@ -28,7 +29,6 @@ use candle_core::quantized::{
 };
 use candle_core::{DType, Device, Tensor};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
-use mistralrs_lora::Ordering;
 use rand_isaac::Isaac64Rng;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -314,6 +314,11 @@ impl Loader for GGUFLoader {
                 "You are trying to in-situ quantize a GGUF model. This will not do anything."
             );
         }
+        // Otherwise, the device mapper will print it
+        if mapper.is_dummy() {
+            info!("Loading model `{}` on {device:?}...", self.get_id());
+        }
+
         let mut file = std::fs::File::open(paths.get_weight_filenames().first().unwrap())?;
         let model = gguf_file::Content::read(&mut file)
             .map_err(|e| e.with_path(paths.get_weight_filenames().first().unwrap()))?;
